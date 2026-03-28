@@ -1,0 +1,101 @@
+name: Deploy to AWS EKS
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-1               # Change to your AWS region
+  ECR_REPOSITORY: ip-ranges-api       # Change to your ECR repository name
+  EKS_CLUSTER_NAME: my-eks-cluster    # Change to your EKS cluster name
+  K8S_NAMESPACE: default              # Change to your target namespace
+
+jobs:
+  # ─── Job 1: Run tests ─────────────────────────────────────────────────────
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+  # ─── Job 2: Build, push, and deploy ───────────────────────────────────────
+  deploy:
+    name: Build, Push & Deploy
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      id-token: write   # Required for OIDC authentication with AWS
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Authenticate to AWS using OIDC (no long-lived credentials stored)
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Log in to Amazon ECR
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Build and push the Docker image to ECR
+      - name: Build, tag, and push image to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          # Also tag as 'latest' for convenience
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      # Update kubeconfig to authenticate with the EKS cluster
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region $AWS_REGION \
+            --name $EKS_CLUSTER_NAME
+
+      # Update the image in deployment.yaml and apply all manifests
+      - name: Deploy to EKS
+        env:
+          IMAGE: ${{ steps.build-image.outputs.image }}
+        run: |
+          # deployment.yaml uses 'image: ip-ranges-api:latest' as the placeholder;
+          # replace it with the fully-qualified ECR image built in this run.
+          sed -i "s|image: $ECR_REPOSITORY:latest|image: $IMAGE|g" k8s/deployment.yaml
+
+          kubectl apply -f k8s/deployment.yaml  --namespace $K8S_NAMESPACE
+          kubectl apply -f k8s/service.yaml     --namespace $K8S_NAMESPACE
+          kubectl apply -f k8s/ingress-eks.yaml --namespace $K8S_NAMESPACE
+
+      # Wait for the rollout to complete and report its status
+      - name: Verify deployment rollout
+        run: |
+          kubectl rollout status deployment/$ECR_REPOSITORY \
+            --namespace $K8S_NAMESPACE \
+            --timeout=120s
